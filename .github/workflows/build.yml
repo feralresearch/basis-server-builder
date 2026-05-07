@@ -1,0 +1,191 @@
+name: Build basis-server binaries
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if a release already exists for the current SHA'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: BasisVR/basis
+  RIDS: 'win-x64 linux-x64 osx-arm64'
+
+jobs:
+  resolve:
+    name: Resolve upstream refs
+    runs-on: ubuntu-latest
+    outputs:
+      nightly_sha:    ${{ steps.r.outputs.nightly_sha }}
+      nightly_needed: ${{ steps.r.outputs.nightly_needed }}
+      stable_branch: ${{ steps.r.outputs.stable_branch }}
+      stable_sha:    ${{ steps.r.outputs.stable_sha }}
+      stable_needed: ${{ steps.r.outputs.stable_needed }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          api() { curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$@"; }
+
+          tag_exists() {
+            gh release view "$1" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          }
+
+          # --- nightly: developer branch
+          nightly_sha=$(api "https://api.github.com/repos/$UPSTREAM_REPO/commits/developer" | jq -r .sha | cut -c1-7)
+          echo "nightly_sha=$nightly_sha" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ] || ! tag_exists "nightly-$nightly_sha"; then
+            echo "nightly_needed=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "nightly_needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # --- stable: latest long-term-support-* branch (lexicographic max works for YYYYMMDD suffix)
+          stable_branch=$(api "https://api.github.com/repos/$UPSTREAM_REPO/branches?per_page=100" \
+            | jq -r '.[].name' | grep '^long-term-support' | sort -r | head -n1 || true)
+          if [ -z "$stable_branch" ]; then
+            echo "stable_branch=" >> "$GITHUB_OUTPUT"
+            echo "stable_sha="    >> "$GITHUB_OUTPUT"
+            echo "stable_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            stable_sha=$(api "https://api.github.com/repos/$UPSTREAM_REPO/commits/$stable_branch" | jq -r .sha | cut -c1-7)
+            echo "stable_branch=$stable_branch" >> "$GITHUB_OUTPUT"
+            echo "stable_sha=$stable_sha"       >> "$GITHUB_OUTPUT"
+            if [ "$FORCE" = "true" ] || ! tag_exists "stable-$stable_sha"; then
+              echo "stable_needed=true"  >> "$GITHUB_OUTPUT"
+            else
+              echo "stable_needed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  build-nightly:
+    needs: resolve
+    if: needs.resolve.outputs.nightly_needed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, linux-x64, osx-arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: developer
+          path: basis
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish ${{ matrix.rid }}
+        run: |
+          set -eux
+          dotnet publish "basis/Basis Server/BasisServerConsole/BasisNetworkConsole.csproj" \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -o "out/${{ matrix.rid }}"
+      - name: Package
+        run: |
+          set -eux
+          mkdir -p artifacts
+          tar -C "out/${{ matrix.rid }}" -czf "artifacts/basis-server-${{ matrix.rid }}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ matrix.rid }}
+          path: artifacts/
+
+  release-nightly:
+    needs: [resolve, build-nightly]
+    if: needs.resolve.outputs.nightly_needed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nightly-*
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.nightly_sha }}
+        run: |
+          set -eux
+          tag="nightly-$SHA"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes "Built from $UPSTREAM_REPO@$SHA (developer)" \
+            --prerelease \
+            dist/*
+
+  build-stable:
+    needs: resolve
+    if: needs.resolve.outputs.stable_needed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, linux-x64, osx-arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.stable_branch }}
+          path: basis
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish ${{ matrix.rid }}
+        run: |
+          set -eux
+          dotnet publish "basis/Basis Server/BasisServerConsole/BasisNetworkConsole.csproj" \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -o "out/${{ matrix.rid }}"
+      - name: Package
+        run: |
+          set -eux
+          mkdir -p artifacts
+          tar -C "out/${{ matrix.rid }}" -czf "artifacts/basis-server-${{ matrix.rid }}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stable-${{ matrix.rid }}
+          path: artifacts/
+
+  release-stable:
+    needs: [resolve, build-stable]
+    if: needs.resolve.outputs.stable_needed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: stable-*
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA:    ${{ needs.resolve.outputs.stable_sha }}
+          BRANCH: ${{ needs.resolve.outputs.stable_branch }}
+        run: |
+          set -eux
+          tag="stable-$SHA"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes "Built from $UPSTREAM_REPO@$SHA ($BRANCH)" \
+            --latest \
+            dist/*

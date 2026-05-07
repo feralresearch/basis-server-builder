@@ -1,0 +1,4 @@
+out/
+artifacts/
+dist/
+*.tar.gz
